@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libipld::cid::Cid;
 use libipld::store::StoreParams;
-use libp2p::request_response::{ProtocolName, RequestResponseCodec};
+use libp2p::request_response;
 use std::convert::TryFrom;
 use std::io::{self, Write};
 use std::marker::PhantomData;
@@ -15,9 +15,9 @@ const MAX_CID_SIZE: usize = 4 * 10 + 64;
 #[derive(Clone, Debug)]
 pub struct BitswapProtocol;
 
-impl ProtocolName for BitswapProtocol {
-    fn protocol_name(&self) -> &[u8] {
-        b"/ipfs-embed/bitswap/1.0.0"
+impl AsRef<str> for BitswapProtocol {
+    fn as_ref(&self) -> &str {
+        "/ipfs-embed/bitswap/1.0.0"
     }
 }
 
@@ -39,7 +39,7 @@ impl<P: StoreParams> Default for BitswapCodec<P> {
 }
 
 #[async_trait]
-impl<P: StoreParams> RequestResponseCodec for BitswapCodec<P> {
+impl<P: StoreParams> request_response::Codec for BitswapCodec<P> {
     type Protocol = BitswapProtocol;
     type Request = BitswapRequest;
     type Response = BitswapResponse;

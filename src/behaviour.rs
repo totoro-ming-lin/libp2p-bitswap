@@ -23,16 +23,20 @@ use futures::{
 use libipld::{error::BlockNotFound, store::StoreParams, Block, Cid, Result};
 #[cfg(feature = "compat")]
 use libp2p::core::either::EitherOutput;
-use libp2p::core::{connection::ConnectionId, Multiaddr, PeerId};
+use libp2p::core::{Endpoint, Multiaddr};
+use libp2p::request_response::OutboundRequestId;
 use libp2p::swarm::derive_prelude::{ConnectionClosed, DialFailure, FromSwarm, ListenFailure};
+use libp2p::swarm::{
+    ConnectionDenied, ConnectionId, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
+};
 #[cfg(feature = "compat")]
 use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler};
+use libp2p::PeerId;
 use libp2p::{
     request_response::{
-        InboundFailure, OutboundFailure, ProtocolSupport, RequestId, RequestResponse,
-        RequestResponseConfig, RequestResponseEvent, RequestResponseMessage, ResponseChannel,
+        self, InboundFailure, InboundRequestId, OutboundFailure, ProtocolSupport, ResponseChannel,
     },
-    swarm::{ConnectionHandler, NetworkBehaviour, NetworkBehaviourAction, PollParameters},
+    swarm::NetworkBehaviour,
 };
 use prometheus::Registry;
 use std::{pin::Pin, time::Duration};
@@ -92,7 +96,7 @@ impl Default for BitswapConfig {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum BitswapId {
-    Bitswap(RequestId),
+    Bitswap(OutboundRequestId),
     #[cfg(feature = "compat")]
     Compat(Cid),
 }
@@ -106,7 +110,7 @@ enum BitswapChannel {
 /// Network behaviour that handles sending and receiving blocks.
 pub struct Bitswap<P: StoreParams> {
     /// Inner behaviour.
-    inner: RequestResponse<BitswapCodec<P>>,
+    inner: request_response::Behaviour<BitswapCodec<P>>,
     /// Query manager.
     query_manager: QueryManager,
     /// Requests.
@@ -123,11 +127,16 @@ pub struct Bitswap<P: StoreParams> {
 impl<P: StoreParams> Bitswap<P> {
     /// Creates a new `Bitswap` behaviour.
     pub fn new<S: BitswapStore<Params = P>>(config: BitswapConfig, store: S) -> Self {
-        let mut rr_config = RequestResponseConfig::default();
-        rr_config.set_connection_keep_alive(config.connection_keep_alive);
-        rr_config.set_request_timeout(config.request_timeout);
+        let mut rr_config = request_response::Config::default();
+        // TODO: If we want to set this one we need to use SwarmBuilder::set_idle_timeout
+        // rr_config.set_connection_keep_alive(config.connection_keep_alive);
+        rr_config = rr_config.with_request_timeout(config.request_timeout);
         let protocols = std::iter::once((BitswapProtocol, ProtocolSupport::Full));
-        let inner = RequestResponse::new(BitswapCodec::<P>::default(), protocols, rr_config);
+        let inner = request_response::Behaviour::with_codec(
+            BitswapCodec::<P>::default(),
+            protocols,
+            rr_config,
+        );
         let (db_tx, db_rx) = start_db_thread(store);
         Self {
             inner,
@@ -303,7 +312,7 @@ impl<P: StoreParams> Bitswap<P> {
     fn inject_outbound_failure(
         &mut self,
         peer: &PeerId,
-        request_id: RequestId,
+        request_id: OutboundRequestId,
         error: &OutboundFailure,
     ) {
         tracing::debug!(
@@ -329,13 +338,16 @@ impl<P: StoreParams> Bitswap<P> {
                     .with_label_values(&["unsupported_protocols"])
                     .inc();
             }
+            OutboundFailure::Io(_) => {
+                INBOUND_FAILURE.with_label_values(&["io_error"]).inc();
+            }
         }
     }
 
     fn inject_inbound_failure(
         &mut self,
         peer: &PeerId,
-        request_id: RequestId,
+        request_id: InboundRequestId,
         error: &InboundFailure,
     ) {
         tracing::error!(
@@ -363,6 +375,9 @@ impl<P: StoreParams> Bitswap<P> {
                     .with_label_values(&["response_omission"])
                     .inc();
             }
+            InboundFailure::Io(_) => {
+                INBOUND_FAILURE.with_label_values(&["io_error"]).inc();
+            }
         }
     }
 }
@@ -370,7 +385,7 @@ impl<P: StoreParams> Bitswap<P> {
 impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     #[cfg(not(feature = "compat"))]
     type ConnectionHandler =
-        <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ConnectionHandler;
+        <request_response::Behaviour<BitswapCodec<P>> as NetworkBehaviour>::ConnectionHandler;
 
     #[cfg(feature = "compat")]
     #[allow(clippy::type_complexity)]
@@ -378,20 +393,34 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         <RequestResponse<BitswapCodec<P>> as NetworkBehaviour>::ConnectionHandler,
         OneShotHandler<CompatProtocol, CompatMessage, InboundMessage>,
     >;
-    type OutEvent = BitswapEvent;
+    type ToSwarm = BitswapEvent;
 
-    fn new_handler(&mut self) -> Self::ConnectionHandler {
-        #[cfg(not(feature = "compat"))]
-        return self.inner.new_handler();
-        #[cfg(feature = "compat")]
-        ConnectionHandler::select(self.inner.new_handler(), OneShotHandler::default())
+    fn handle_established_inbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.inner.handle_established_inbound_connection(
+            connection_id,
+            peer,
+            local_addr,
+            remote_addr,
+        )
+    }
+    fn handle_established_outbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        addr: &Multiaddr,
+        role_override: Endpoint,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.inner
+            .handle_established_outbound_connection(connection_id, peer, addr, role_override)
     }
 
-    fn addresses_of_peer(&mut self, peer_id: &PeerId) -> Vec<Multiaddr> {
-        self.inner.addresses_of_peer(peer_id)
-    }
-
-    fn on_swarm_event(&mut self, event: FromSwarm<Self::ConnectionHandler>) {
+    fn on_swarm_event(&mut self, event: FromSwarm) {
         match event {
             FromSwarm::ConnectionEstablished(ev) => self
                 .inner
@@ -400,7 +429,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 peer_id,
                 connection_id,
                 endpoint,
-                handler,
                 remaining_established,
             }) => {
                 #[cfg(feature = "compat")]
@@ -414,13 +442,12 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         peer_id,
                         connection_id,
                         endpoint,
-                        handler,
                         remaining_established,
                     }));
             }
             FromSwarm::DialFailure(DialFailure {
                 peer_id,
-                handler,
+                connection_id,
                 error,
             }) => {
                 #[cfg(feature = "compat")]
@@ -428,7 +455,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 self.inner
                     .on_swarm_event(FromSwarm::DialFailure(DialFailure {
                         peer_id,
-                        handler,
+                        connection_id,
                         error,
                     }));
             }
@@ -436,7 +463,8 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             FromSwarm::ListenFailure(ListenFailure {
                 local_addr,
                 send_back_addr,
-                handler,
+                error,
+                connection_id,
             }) => {
                 #[cfg(feature = "compat")]
                 let (handler, _oneshot) = handler.into_inner();
@@ -444,7 +472,8 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     .on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
                         local_addr,
                         send_back_addr,
-                        handler,
+                        error,
+                        connection_id,
                     }));
             }
             FromSwarm::NewListener(ev) => self.inner.on_swarm_event(FromSwarm::NewListener(ev)),
@@ -456,12 +485,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             FromSwarm::ListenerClosed(ev) => {
                 self.inner.on_swarm_event(FromSwarm::ListenerClosed(ev))
             }
-            FromSwarm::NewExternalAddr(ev) => {
-                self.inner.on_swarm_event(FromSwarm::NewExternalAddr(ev))
-            }
-            FromSwarm::ExpiredExternalAddr(ev) => self
-                .inner
-                .on_swarm_event(FromSwarm::ExpiredExternalAddr(ev)),
+            _ => {}
         }
     }
 
@@ -469,7 +493,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         &mut self,
         peer_id: PeerId,
         conn: ConnectionId,
-        event: <Self::ConnectionHandler as ConnectionHandler>::OutEvent,
+        event: THandlerOutEvent<Self>,
     ) {
         #[cfg(not(feature = "compat"))]
         return self.inner.on_connection_handler_event(peer_id, conn, event);
@@ -495,11 +519,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         }
     }
 
-    fn poll(
-        &mut self,
-        cx: &mut Context,
-        pp: &mut impl PollParameters,
-    ) -> Poll<NetworkBehaviourAction<Self::OutEvent, Self::ConnectionHandler>> {
+    fn poll(&mut self, cx: &mut Context) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         let mut exit = false;
         while !exit {
             exit = true;
@@ -513,7 +533,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         #[cfg(feature = "compat")]
                         BitswapChannel::Compat(peer_id, cid) => {
                             let compat = CompatMessage::Response(cid, response);
-                            return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                            return Poll::Ready(FromSwarm::NotifyHandler {
                                 peer_id,
                                 handler: NotifyHandler::Any,
                                 event: EitherOutput::Second(compat),
@@ -529,7 +549,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         Err(err) => {
                             self.query_manager.cancel(id);
                             let event = BitswapEvent::Complete(id, Err(err));
-                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                            return Poll::Ready(ToSwarm::GenerateEvent(event));
                         }
                     },
                 }
@@ -562,7 +582,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     },
                     QueryEvent::Progress(id, missing) => {
                         let event = BitswapEvent::Progress(id, missing);
-                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                        return Poll::Ready(ToSwarm::GenerateEvent(event));
                     }
                     QueryEvent::Complete(id, res) => {
                         if res.is_err() {
@@ -572,25 +592,25 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             id,
                             res.map_err(|cid| BlockNotFound(cid).into()),
                         );
-                        return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event));
+                        return Poll::Ready(ToSwarm::GenerateEvent(event));
                     }
                 }
             }
-            while let Poll::Ready(event) = self.inner.poll(cx, pp) {
+            while let Poll::Ready(event) = self.inner.poll(cx) {
                 exit = false;
                 let event = match event {
-                    NetworkBehaviourAction::GenerateEvent(event) => event,
-                    NetworkBehaviourAction::Dial { opts, handler } => {
+                    ToSwarm::GenerateEvent(event) => event,
+                    ToSwarm::Dial { opts } => {
                         #[cfg(feature = "compat")]
                         let handler = ConnectionHandler::select(handler, Default::default());
-                        return Poll::Ready(NetworkBehaviourAction::Dial { opts, handler });
+                        return Poll::Ready(ToSwarm::Dial { opts });
                     }
-                    NetworkBehaviourAction::NotifyHandler {
+                    ToSwarm::NotifyHandler {
                         peer_id,
                         handler,
                         event,
                     } => {
-                        return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                        return Poll::Ready(ToSwarm::NotifyHandler {
                             peer_id,
                             handler,
                             #[cfg(not(feature = "compat"))]
@@ -599,36 +619,37 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             event: EitherOutput::First(event),
                         });
                     }
-                    NetworkBehaviourAction::ReportObservedAddr { address, score } => {
-                        return Poll::Ready(NetworkBehaviourAction::ReportObservedAddr {
-                            address,
-                            score,
-                        });
+                    ToSwarm::ExternalAddrConfirmed(address) => {
+                        return Poll::Ready(ToSwarm::ExternalAddrConfirmed(address));
                     }
-                    NetworkBehaviourAction::CloseConnection {
+                    ToSwarm::CloseConnection {
                         peer_id,
                         connection,
                     } => {
-                        return Poll::Ready(NetworkBehaviourAction::CloseConnection {
+                        return Poll::Ready(ToSwarm::CloseConnection {
                             peer_id,
                             connection,
                         });
                     }
+                    _ => {
+                        // FIXME: We need to figure out what goes here
+                        todo!();
+                    }
                 };
                 match event {
-                    RequestResponseEvent::Message { peer, message } => match message {
-                        RequestResponseMessage::Request {
+                    request_response::Event::Message { peer, message } => match message {
+                        request_response::Message::Request {
                             request_id: _,
                             request,
                             channel,
                         } => self.inject_request(BitswapChannel::Bitswap(channel), request),
-                        RequestResponseMessage::Response {
+                        request_response::Message::Response {
                             request_id,
                             response,
                         } => self.inject_response(BitswapId::Bitswap(request_id), peer, response),
                     },
-                    RequestResponseEvent::ResponseSent { .. } => {}
-                    RequestResponseEvent::OutboundFailure {
+                    request_response::Event::ResponseSent { .. } => {}
+                    request_response::Event::OutboundFailure {
                         peer,
                         request_id,
                         error,
@@ -648,7 +669,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                     self.requests.insert(BitswapId::Compat(info.cid), id);
                                     tracing::trace!("adding compat peer {}", peer);
                                     self.compat.insert(peer);
-                                    return Poll::Ready(NetworkBehaviourAction::NotifyHandler {
+                                    return Poll::Ready(FromSwarm::NotifyHandler {
                                         peer_id: peer,
                                         handler: NotifyHandler::Any,
                                         event: EitherOutput::Second(CompatMessage::Request(
@@ -663,7 +684,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                 .inject_response(id, Response::Have(peer, false));
                         }
                     }
-                    RequestResponseEvent::InboundFailure {
+                    request_response::Event::InboundFailure {
                         peer,
                         request_id,
                         error,
@@ -688,14 +709,10 @@ mod tests {
     use libipld::ipld::Ipld;
     use libipld::multihash::Code;
     use libipld::store::DefaultParams;
-    use libp2p::core::muxing::StreamMuxerBox;
-    use libp2p::core::transport::Boxed;
     use libp2p::identity;
-    use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
     use libp2p::swarm::SwarmEvent;
-    use libp2p::tcp::{self, async_io};
-    use libp2p::yamux::YamuxConfig;
-    use libp2p::{PeerId, Swarm, Transport};
+    use libp2p::tcp::{self};
+    use libp2p::{noise, yamux, PeerId, Swarm};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -704,23 +721,6 @@ mod tests {
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .try_init()
             .ok();
-    }
-
-    fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox)>) {
-        let id_key = identity::Keypair::generate_ed25519();
-        let peer_id = id_key.public().to_peer_id();
-        let dh_key = Keypair::<X25519Spec>::new()
-            .into_authentic(&id_key)
-            .unwrap();
-        let noise = NoiseConfig::xx(dh_key).into_authenticated();
-
-        let transport = async_io::Transport::new(tcp::Config::new().nodelay(true))
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(noise)
-            .multiplex(YamuxConfig::default())
-            .timeout(Duration::from_secs(20))
-            .boxed();
-        (peer_id, transport)
     }
 
     fn create_block(ipld: Ipld) -> Block<DefaultParams> {
@@ -769,13 +769,24 @@ mod tests {
 
     impl Peer {
         fn new() -> Self {
-            let (peer_id, trans) = mk_transport();
+            // Create a public/private key pair, either random or based on a seed.
+            let id_keys = identity::Keypair::generate_ed25519();
+            let peer_id = id_keys.public().to_peer_id();
             let store = Store::default();
-            let mut swarm = Swarm::with_async_std_executor(
-                trans,
-                Bitswap::new(BitswapConfig::new(), store.clone()),
-                peer_id,
-            );
+
+            let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
+                .with_async_std()
+                .with_tcp(
+                    tcp::Config::default(),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )
+                .unwrap()
+                .with_behaviour(|_| Bitswap::new(BitswapConfig::new(), store.clone()))
+                .unwrap()
+                .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+                .build();
+
             Swarm::listen_on(&mut swarm, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
             while swarm.next().now_or_never().is_some() {}
             let addr = Swarm::listeners(&swarm).next().unwrap().clone();
