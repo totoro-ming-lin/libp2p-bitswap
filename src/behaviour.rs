@@ -624,44 +624,12 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             }
             while let Poll::Ready(event) = self.inner.poll(cx) {
                 exit = false;
+
                 let event = match event {
                     ToSwarm::GenerateEvent(event) => event,
-                    ToSwarm::Dial { opts } => {
-                        #[cfg(feature = "compat")]
-                        let handler = ConnectionHandler::select(handler, Default::default());
-                        return Poll::Ready(ToSwarm::Dial { opts });
-                    }
-                    ToSwarm::NotifyHandler {
-                        peer_id,
-                        handler,
-                        event,
-                    } => {
-                        return Poll::Ready(ToSwarm::NotifyHandler {
-                            peer_id,
-                            handler,
-                            #[cfg(not(feature = "compat"))]
-                            event,
-                            #[cfg(feature = "compat")]
-                            event: EitherOutput::First(event),
-                        });
-                    }
-                    ToSwarm::ExternalAddrConfirmed(address) => {
-                        return Poll::Ready(ToSwarm::ExternalAddrConfirmed(address));
-                    }
-                    ToSwarm::CloseConnection {
-                        peer_id,
-                        connection,
-                    } => {
-                        return Poll::Ready(ToSwarm::CloseConnection {
-                            peer_id,
-                            connection,
-                        });
-                    }
-                    _ => {
-                        // FIXME: We need to figure out what goes here
-                        todo!();
-                    }
+                    other => return Poll::Ready(other.map_out(|_| unreachable!())),
                 };
+
                 match event {
                     request_response::Event::Message { peer, message } => match message {
                         request_response::Message::Request {
