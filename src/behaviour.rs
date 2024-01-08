@@ -74,8 +74,6 @@ pub trait BitswapStore: Send + Sync + 'static {
 pub struct BitswapConfig {
     /// Timeout of a request.
     pub request_timeout: Duration,
-    /// Time a connection is kept alive.
-    pub connection_keep_alive: Duration,
 }
 
 impl BitswapConfig {
@@ -83,7 +81,6 @@ impl BitswapConfig {
     pub fn new() -> Self {
         Self {
             request_timeout: Duration::from_secs(10),
-            connection_keep_alive: Duration::from_secs(10),
         }
     }
 }
@@ -127,10 +124,8 @@ pub struct Bitswap<P: StoreParams> {
 impl<P: StoreParams> Bitswap<P> {
     /// Creates a new `Bitswap` behaviour.
     pub fn new<S: BitswapStore<Params = P>>(config: BitswapConfig, store: S) -> Self {
-        let mut rr_config = request_response::Config::default();
-        // TODO: If we want to set this one we need to use SwarmBuilder::set_idle_timeout
-        // rr_config.set_connection_keep_alive(config.connection_keep_alive);
-        rr_config = rr_config.with_request_timeout(config.request_timeout);
+        let rr_config =
+            request_response::Config::default().with_request_timeout(config.request_timeout);
         let protocols = std::iter::once((BitswapProtocol, ProtocolSupport::Full));
         let inner = request_response::Behaviour::with_codec(
             BitswapCodec::<P>::default(),
